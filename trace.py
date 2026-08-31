@@ -166,8 +166,11 @@ class TraceAnalyzer:
         except Exception as e:
             logging.debug(e)
         finally:
-            cap.close()
-        
+            try:
+                cap.close()
+            except Exception as e:
+                logging.debug(e)
+
         if has_non_decrypted:
             logging.info("At least one QUIC packet could not be decrypted")
 
