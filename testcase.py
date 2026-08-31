@@ -1,19 +1,20 @@
 import abc
-import tempfile
-import logging
-import subprocess
 import filecmp
-import shutil
-import sys
-from unique_random_slugs import generate_slug
+import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from enum import Enum
-from Crypto.Cipher import AES
-from trace import Direction, TraceAnalyzer
 from typing import List
 
+from Crypto.Cipher import AES
+
 from result import TestResult
+from trace import Direction, TraceAnalyzer
+from unique_random_slugs import generate_slug
 
 QUIC_VERSION = hex(0x1)
 
@@ -238,7 +239,12 @@ class TestCase(abc.ABC):
         return filename
 
     def _retry_sent(self) -> bool:
-        return len(self._client_trace().get_retry()) > 0
+        res = False
+        def _upd(p):
+            nonlocal res
+            res = True
+        self._client_trace().for_each_retry(_upd)
+        return res
 
     def _check_version_and_files(self) -> bool:
         versions = [hex(int(v, 0)) for v in self._get_versions()]
@@ -307,31 +313,29 @@ class TestCase(abc.ABC):
         logging.debug("Check of downloaded files succeeded.")
         return True
 
+
     def _count_handshakes(self) -> int:
         """Count the number of QUIC handshakes"""
         tr = self._server_trace()
         # Determine the number of handshakes by looking at Initial packets.
         # This is easier, since the SCID of Initial packets doesn't changes.
-        return len(set([p.scid for p in tr.get_initial(Direction.FROM_SERVER)]))
+        scids = set()
+        def _collect_scid(p):
+            scids.add(p.scid)
+
+        tr.for_each_initial(_collect_scid, Direction.FROM_SERVER)
+        return len(scids)
+
 
     def _get_versions(self) -> set:
         """Get the QUIC versions"""
         tr = self._server_trace()
-        return set([p.version for p in tr.get_initial(Direction.FROM_SERVER)])
+        versions = set()
+        def _collect_version(p):
+            versions.add(p.version)
 
-    def _payload_size(self, packets: List) -> int:
-        """Get the sum of the payload sizes of all packets"""
-        size = 0
-        for p in packets:
-            if hasattr(p, "long_packet_type") or hasattr(p, "long_packet_type_v2"):
-                if hasattr(p, "payload"):  # when keys are available
-                    size += len(p.payload.split(":"))
-                else:
-                    size += len(p.remaining_payload.split(":"))
-            else:
-                if hasattr(p, "protected_payload"):
-                    size += len(p.protected_payload.split(":"))
-        return size
+        tr.for_each_initial(_collect_version, Direction.FROM_SERVER)
+        return versions
 
     def cleanup(self):
         for d in [self._client_download_dir, self._server_download_dir]:

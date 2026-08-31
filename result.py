@@ -13,3 +13,11 @@ class TestResult(Enum):
             return "✕"
         elif self == TestResult.UNSUPPORTED:
             return "?"
+
+
+class FailedTestException(Exception):
+    pass
+
+
+class PassedTestException(Exception):
+    pass

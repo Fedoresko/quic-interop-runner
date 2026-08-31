@@ -1,9 +1,10 @@
-import datetime
 import logging
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Optional, Callable
 
 import pyshark
+
+from result import FailedTestException, PassedTestException
 
 IP4_CLIENT = "193.167.0.100"
 IP4_SERVER = "193.167.100.100"
@@ -76,6 +77,47 @@ def get_packet_type(p) -> PacketType:
             return t
     return PacketType.INVALID
 
+class LongHeaderFilter:
+    _func: Callable
+    packet_type: PacketType
+
+    def __init__(self, packet_type: PacketType, func: Callable):
+        self._func = func
+        self.packet_type = packet_type
+
+    def filter(self, p):
+        for layer in p.layers:
+            if layer.layer_name == "quic" and (
+                    (
+                            hasattr(layer, "long_packet_type")
+                            and layer.long_packet_type
+                            == WIRESHARK_PACKET_TYPES[self.packet_type]
+                    )
+                    or (
+                            hasattr(layer, "long_packet_type_v2")
+                            and layer.long_packet_type_v2
+                            == WIRESHARK_PACKET_TYPES_V2[self.packet_type]
+                    )
+            ):
+                self._func(layer)
+
+
+
+class OneRttFilter:
+    _func: Callable
+
+    def __init__(self, func: Callable):
+            self._func = func
+
+    def filter(self, p):
+        for layer in p.layers:
+            if (
+                    layer.layer_name == "quic"
+                    and not hasattr(layer, "long_packet_type")
+                    and not hasattr(layer, "long_packet_type_v2")
+            ): self._func(layer);
+
+
 
 class TraceAnalyzer:
     _filename = ""
@@ -97,111 +139,80 @@ class TraceAnalyzer:
         else:
             return f
 
-    def _get_packets(self, f: str) -> List:
+    def _for_each_packet(self, filter_str: str, fun : Callable) -> None:
         override_prefs = {}
         if self._keylog_file is not None:
             override_prefs["tls.keylog_file"] = self._keylog_file
         cap = pyshark.FileCapture(
             self._filename,
-            display_filter=f,
+            display_filter=filter_str,
+            keep_packets = False,
             override_prefs=override_prefs,
             disable_protocol="http3",  # see https://github.com/quic-interop/quic-interop-runner/pull/179
             decode_as={"udp.port==443": "quic"},
         )
-        packets = []
         # If the pcap has been cut short in the middle of the packet, pyshark will crash.
         # See https://github.com/KimiNewt/pyshark/issues/390.
+        # -- or in case of OOM due to storing all PCAP as XML
+        
+        has_non_decrypted = False
         try:
             for p in cap:
-                if "quic" not in p:
-                    logging.info("Captured packet without quic layer: %r", p)
-                    continue
-                packets.append(p)
+                if hasattr(p["quic"], "decryption_failed"):
+                    has_non_decrypted = True
+                else: fun(p)
+        except (FailedTestException, PassedTestException):
+            raise
         except Exception as e:
             logging.debug(e)
-        cap.close()
+        finally:
+            cap.close()
+        
+        if has_non_decrypted:
+            logging.info("At least one QUIC packet could not be decrypted")
 
-        if self._keylog_file is not None:
-            for p in packets:
-                if hasattr(p["quic"], "decryption_failed"):
-                    logging.info("At least one QUIC packet could not be decrypted")
-                    logging.debug(p)
-                    break
-        return packets
 
-    def get_raw_packets(self, direction: Direction = Direction.ALL) -> List:
-        packets = []
-        for packet in self._get_packets(self._get_direction_filter(direction) + "quic"):
-            packets.append(packet)
-        return packets
+    def for_each_raw_packet(self, fun: Callable, direction: Direction = Direction.ALL):
+        self._for_each_packet(fun, self._get_direction_filter(direction) + "quic")
 
-    def get_1rtt(self, direction: Direction = Direction.ALL) -> List:
+
+    def for_each_1rtt(self, fun: Callable, direction: Direction = Direction.ALL):
         """Get all QUIC packets, one or both directions."""
-        packets, _, _ = self.get_1rtt_sniff_times(direction)
-        return packets
+        one_rtt_filter = OneRttFilter(fun)
 
-    def get_1rtt_sniff_times(
-        self, direction: Direction = Direction.ALL
-    ) -> Tuple[List, datetime.datetime, datetime.datetime]:
-        """Get all QUIC packets, one or both directions, and first and last sniff times."""
-        packets = []
-        first, last = 0, 0
-        for packet in self._get_packets(
-            self._get_direction_filter(direction) + "quic.header_form==0"
-        ):
-            for layer in packet.layers:
-                if (
-                    layer.layer_name == "quic"
-                    and not hasattr(layer, "long_packet_type")
-                    and not hasattr(layer, "long_packet_type_v2")
-                ):
-                    if first == 0:
-                        first = packet.sniff_time
-                    last = packet.sniff_time
-                    packets.append(layer)
-        return packets, first, last
-
-    def get_vnp(self, direction: Direction = Direction.ALL) -> List:
-        return self._get_packets(
-            self._get_direction_filter(direction) + "quic.version==0"
+        self._for_each_packet(
+            self._get_direction_filter(direction) + "quic.header_form==0",
+            one_rtt_filter.filter
         )
 
-    def _get_long_header_packets(
-        self, packet_type: PacketType, direction: Direction
-    ) -> List:
-        packets = []
-        for packet in self._get_packets(
+    def for_each_version_negotiation_packet(self, fun : Callable, direction: Direction = Direction.ALL):
+        self._for_each_packet(
+            self._get_direction_filter(direction) + "quic.version==0",
+            fun
+        )
+
+    def _for_each_long_header_packet(
+        self, packet_type: PacketType, fun: Callable, direction: Direction
+    ):
+        lh_filter = LongHeaderFilter(packet_type, fun)
+        self._for_each_packet(
             self._get_direction_filter(direction)
-            + "(quic.long.packet_type || quic.long.packet_type_v2)"
-        ):
-            for layer in packet.layers:
-                if layer.layer_name == "quic" and (
-                    (
-                        hasattr(layer, "long_packet_type")
-                        and layer.long_packet_type
-                        == WIRESHARK_PACKET_TYPES[packet_type]
-                    )
-                    or (
-                        hasattr(layer, "long_packet_type_v2")
-                        and layer.long_packet_type_v2
-                        == WIRESHARK_PACKET_TYPES_V2[packet_type]
-                    )
-                ):
-                    packets.append(layer)
-        return packets
+            + "(quic.long.packet_type || quic.long.packet_type_v2)",
+            lh_filter.filter
+        )
 
-    def get_initial(self, direction: Direction = Direction.ALL) -> List:
-        """Get all Initial packets."""
-        return self._get_long_header_packets(PacketType.INITIAL, direction)
+    def for_each_initial(self, fun : Callable, direction: Direction = Direction.ALL):
+        """Each Initial packet."""
+        self._for_each_long_header_packet(PacketType.INITIAL, fun, direction)
 
-    def get_retry(self, direction: Direction = Direction.ALL) -> List:
-        """Get all Retry packets."""
-        return self._get_long_header_packets(PacketType.RETRY, direction)
+    def for_each_retry(self, fun : Callable, direction: Direction = Direction.ALL):
+        """Each Retry packet."""
+        self._for_each_long_header_packet(PacketType.RETRY, fun, direction)
 
-    def get_handshake(self, direction: Direction = Direction.ALL) -> List:
-        """Get all Handshake packets."""
-        return self._get_long_header_packets(PacketType.HANDSHAKE, direction)
+    def for_each_handshake(self, fun : Callable, direction: Direction = Direction.ALL):
+        """Each Handshake packet."""
+        self._for_each_long_header_packet(PacketType.HANDSHAKE, fun, direction)
 
-    def get_0rtt(self) -> List:
-        """Get all 0-RTT packets."""
-        return self._get_long_header_packets(PacketType.ZERORTT, Direction.FROM_CLIENT)
+    def for_each_0rtt(self, fun : Callable):
+        """Each 0-RTT packet."""
+        self._for_each_long_header_packet(PacketType.ZERORTT, fun, Direction.FROM_CLIENT)
