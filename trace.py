@@ -104,10 +104,12 @@ class LongHeaderFilter:
 
 
 class OneRttFilter:
-    _func: Callable
+    _on_layer: Callable
+    _on_packet: Callable
 
-    def __init__(self, func: Callable):
-            self._func = func
+    def __init__(self, on_layer: Callable, on_packet: Callable = None):
+            self._on_layer = on_layer
+            self._on_packet = on_packet
 
     def filter(self, p):
         for layer in p.layers:
@@ -115,9 +117,11 @@ class OneRttFilter:
                     layer.layer_name == "quic"
                     and not hasattr(layer, "long_packet_type")
                     and not hasattr(layer, "long_packet_type_v2")
-            ): self._func(layer);
-
-
+            ):
+                if self._on_layer is not None:
+                    self._on_layer(layer)
+                if self._on_packet is not None:
+                    self._on_packet(p)
 
 class TraceAnalyzer:
     _filename = ""
@@ -164,24 +168,24 @@ class TraceAnalyzer:
         except (FailedTestException, PassedTestException):
             raise
         except Exception as e:
-            logging.debug(e)
+            logging.info(e)
         finally:
             try:
                 cap.close()
             except Exception as e:
-                logging.debug(e)
+                logging.info(e)
 
         if has_non_decrypted:
             logging.info("At least one QUIC packet could not be decrypted")
 
 
     def for_each_raw_packet(self, fun: Callable, direction: Direction = Direction.ALL):
-        self._for_each_packet(fun, self._get_direction_filter(direction) + "quic")
+        self._for_each_packet(self._get_direction_filter(direction) + "quic", fun)
 
 
-    def for_each_1rtt(self, fun: Callable, direction: Direction = Direction.ALL):
+    def for_each_1rtt(self, on_layer: Callable, direction: Direction = Direction.ALL, on_packet: Callable = None):
         """Get all QUIC packets, one or both directions."""
-        one_rtt_filter = OneRttFilter(fun)
+        one_rtt_filter = OneRttFilter(on_layer, on_packet)
 
         self._for_each_packet(
             self._get_direction_filter(direction) + "quic.header_form==0",

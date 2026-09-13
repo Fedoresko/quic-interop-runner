@@ -639,56 +639,59 @@ class TestCaseAmplificationLimit(TestCaseQuic):
         allowed = 0
         allowed_with_tolerance = 0
         client_sent, server_sent = 0, 0  # only for debug messages
-        res = TestResult.FAILED
         log_output = []
 
-        try:
-            def _proc_packet(p):
-                nonlocal allowed, allowed_with_tolerance, client_sent, server_sent, res
-                direction = get_direction(p)
-                packet_type = get_packet_type(p)
-                if packet_type == PacketType.VERSIONNEGOTIATION:
-                    logging.info("Didn't expect a Version Negotiation packet.")
-                    raise FailedTestException
-                packet_size = int(p.udp.length) - 8  # subtract the UDP header length
-                if packet_type == PacketType.INVALID:
-                    logging.debug("Couldn't determine packet type.")
-                    raise FailedTestException
-                if direction == Direction.FROM_CLIENT:
-                    if packet_type is PacketType.HANDSHAKE:
-                        res = TestResult.SUCCEEDED
-                    if packet_type is PacketType.INITIAL:
-                        client_sent += packet_size
-                        allowed += 3 * packet_size
-                        allowed_with_tolerance += 4 * packet_size
-                        log_output.append(
-                            "Received a {} byte Initial packet from the client. Amplification limit: {}".format(
-                                packet_size, 3 * client_sent
-                            )
-                        )
-                elif direction == Direction.FROM_SERVER:
-                    server_sent += packet_size
+        def proc_packet(p):
+            nonlocal allowed, allowed_with_tolerance, client_sent, server_sent
+            direction = get_direction(p)
+            packet_type = get_packet_type(p)
+
+            if packet_type == PacketType.VERSIONNEGOTIATION:
+                logging.info("Didn't expect a Version Negotiation packet.")
+                raise FailedTestException
+            packet_size = int(p.udp.length) - 8  # subtract the UDP header length
+            if packet_type == PacketType.INVALID:
+                logging.debug("Couldn't determine packet type.")
+                raise FailedTestException
+            if direction == Direction.FROM_CLIENT:
+                if packet_type is PacketType.HANDSHAKE:
+                    raise PassedTestException
+                if packet_type is PacketType.INITIAL:
+                    client_sent += packet_size
+                    allowed += 3 * packet_size
+                    allowed_with_tolerance += 4 * packet_size
                     log_output.append(
-                        "Received a {} byte Handshake packet from the server. Total: {}".format(
-                            packet_size, server_sent
+                        "Received a {} byte Initial packet from the client. Amplification limit: {}".format(
+                            packet_size, 3 * client_sent
                         )
                     )
-                    if packet_size >= allowed_with_tolerance:
-                        log_output.append("Server violated the amplification limit.")
-                        raise FailedTestException
-                    if packet_size > allowed:
-                        log_output.append(
-                            "Server violated the amplification limit, but stayed within 3-4x amplification. Letting it slide."
-                        )
-                    allowed_with_tolerance -= packet_size
-                    allowed -= packet_size
-                else:
-                    logging.debug("Couldn't determine sender of packet.")
+            elif direction == Direction.FROM_SERVER:
+                server_sent += packet_size
+                log_output.append(
+                    "Received a {} byte Handshake packet from the server. Total: {}".format(
+                        packet_size, server_sent
+                    )
+                )
+                if packet_size >= allowed_with_tolerance:
+                    log_output.append("Server violated the amplification limit.")
                     raise FailedTestException
+                if packet_size > allowed:
+                    log_output.append(
+                        "Server violated the amplification limit, but stayed within 3-4x amplification. Letting it slide."
+                    )
+                allowed_with_tolerance -= packet_size
+                allowed -= packet_size
+            else:
+                logging.debug("Couldn't determine sender of packet.")
+                raise FailedTestException
 
-            self._server_trace().for_each_raw_packet(_proc_packet)
+        res = TestResult.FAILED
+        try:
+            self._server_trace().for_each_raw_packet(proc_packet)
         except FailedTestException:
             res = TestResult.FAILED
+        except PassedTestException:
+            res = TestResult.SUCCEEDED
 
         log_level = logging.DEBUG
         if res == TestResult.FAILED:
@@ -1015,7 +1018,7 @@ class TestCaseECN(TestCaseHandshake):
         has_ack_ecn = False
         self._server_trace()._for_each_packet(
             self._server_trace()._get_direction_filter(Direction.FROM_SERVER) + " quic",
-            count_ecn
+            collect_ecn
         )
 
         ack_ecn_server_ok = has_ack_ecn
@@ -1100,6 +1103,14 @@ class TestCasePortRebinding(TestCaseTransfer):
 
     def check(self) -> TestResult:
         super().check()
+        if not self._keylog_file():
+            logging.info("Can't check test result. SSLKEYLOG required.")
+            return TestResult.UNSUPPORTED
+
+        result = super(TestCasePortRebinding, self).check()
+        if result != TestResult.SUCCEEDED:
+            return result
+
         cur = None
         last = None
         paths = set()
@@ -1107,7 +1118,7 @@ class TestCasePortRebinding(TestCaseTransfer):
         responses = list()
 
         def collect_challenges(p):
-            nonlocal cur, last
+            nonlocal cur, last, paths
             cur = self._path(p)
             if last is None:
                 last = cur
@@ -1130,14 +1141,6 @@ class TestCasePortRebinding(TestCaseTransfer):
         def collect_resp(p):
             if hasattr(p["quic"], "path_response.data"):
                 responses.append(getattr(p["quic"], "path_response.data"))
-
-        if not self._keylog_file():
-            logging.info("Can't check test result. SSLKEYLOG required.")
-            return TestResult.UNSUPPORTED
-
-        result = super(TestCasePortRebinding, self).check()
-        if result != TestResult.SUCCEEDED:
-            return result
 
         try:
             self._server_trace()._for_each_packet(
@@ -1491,10 +1494,6 @@ class MeasurementGoodput(Measurement):
     first = 0
     last = 0
 
-    def _collect_fist_last(self, p):
-        if self.first == 0:
-            self.first = p.sniff_time
-        self.last = p.sniff_time
 
 
     def check(self) -> TestResult:
@@ -1506,17 +1505,24 @@ class MeasurementGoodput(Measurement):
         if not self._check_version_and_files():
             return TestResult.FAILED
 
-        self.first = 0
-        self.last = 0
+        first = 0
+        last = 0
+
+        def collect_fist_last(p):
+            nonlocal first, last
+            if first == 0:
+                first = p.sniff_time
+            last = p.sniff_time
 
         self._client_trace().for_each_1rtt(
-            self._collect_fist_last,
-            Direction.FROM_SERVER
+            None,
+            Direction.FROM_SERVER,
+            on_packet=collect_fist_last
         )
 
-        if self.last - self.first == 0:
+        if last - first == 0:
             return TestResult.FAILED
-        time = (self.last - self.first) / timedelta(milliseconds=1)
+        time = (last - first) / timedelta(milliseconds=1)
         goodput = (8 * self.FILESIZE) / time
         logging.debug(
             "Transfering %d MB took %d ms. Goodput: %d kbps",
