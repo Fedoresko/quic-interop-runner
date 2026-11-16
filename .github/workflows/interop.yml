@@ -164,7 +164,7 @@ jobs:
           name: result-aggregated
           path: result.json
       - name: Upload logs to interop.seemann.io
-        uses: burnett01/rsync-deployments@dc0d5d44c4728aad3f02154a87309809e62a960f # v8.0.4
+        uses: burnett01/rsync-deployments@a45ed8d36c227d1148d4c794d57a22962e1783c2 # v8.0.4
         if: ${{ inputs.upload_results }}
         with:
           switches: -avzr
